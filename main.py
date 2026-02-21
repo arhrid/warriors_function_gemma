@@ -3,7 +3,7 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
-import json, os, time
+import json, os, re, time
 from cactus import cactus_init, cactus_complete, cactus_destroy
 from google import genai
 from google.genai import types
@@ -204,46 +204,157 @@ def _run_cactus(messages, tools, system_prompt=None, tool_rag_top_k=0, enhance=T
     }
 
 
-def generate_hybrid(messages, tools, confidence_threshold=0.99):
-    """Smart hybrid routing: maximize on-device + correctness.
+def _extract_numbers(text):
+    """Extract all numbers from user text for integer arg correction."""
+    return [int(x) for x in re.findall(r'\b(\d+)\b', text)]
 
-    Strategy: on-device with F1>=0.46 beats perfect cloud (scoring math).
-    So we aggressively trust on-device when it produces structurally valid
-    function calls (correct tool name + all required args + type coercion).
-    Cloud only when on-device produces nothing usable.
+
+def _extract_time(text):
+    """Extract hour/minute from time patterns like '10 AM', '3:00 PM', '8:15 AM'."""
+    match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(AM|PM|am|pm|a\.m\.|p\.m\.)', text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2)) if match.group(2) else 0
+        period = match.group(3).upper().replace('.', '')
+        if period == "PM" and hour < 12:
+            hour += 12
+        elif period == "AM" and hour == 12:
+            hour = 0
+        return hour, minute
+    return None, None
+
+
+def _fix_integer_args(call, tool, user_text):
+    """Post-process integer arguments using values extracted from user text."""
+    props = tool["parameters"].get("properties", {})
+    args = dict(call.get("arguments", {}))
+
+    # Check if this tool has hour/minute params (time-related)
+    param_names = set(props.keys())
+    if "hour" in param_names and "minute" in param_names:
+        hour, minute = _extract_time(user_text)
+        if hour is not None:
+            args["hour"] = hour
+            args["minute"] = minute
+            return args
+
+    # For single-integer params, extract from user text
+    int_params = [k for k, v in props.items() if v.get("type") == "integer"]
+    if len(int_params) == 1:
+        numbers = _extract_numbers(user_text)
+        if len(numbers) == 1:
+            args[int_params[0]] = numbers[0]
+
+    return args
+
+
+def _is_multi_request(text):
+    """Detect if user message likely contains multiple requests."""
+    lower = text.lower()
+    if " and " not in lower:
+        return False
+    parts = re.split(r'\s+and\s+', lower)
+    if len(parts) < 2:
+        return False
+    action_words = {"set", "get", "send", "check", "find", "look", "play",
+                    "remind", "text", "search", "create", "what", "how"}
+    action_parts = sum(1 for p in parts
+                       if any(p.strip().startswith(w) for w in action_words))
+    return action_parts >= 2
+
+
+def _is_tool_relevant(tool, user_text):
+    """Check if a tool is semantically relevant to the user text."""
+    desc_words = set(re.findall(r'\w+', tool["description"].lower()))
+    user_words = set(re.findall(r'\w+', user_text.lower()))
+    # Also include tool name words
+    name_words = set(tool["name"].lower().replace("_", " ").split())
+    tool_words = desc_words | name_words
+    # Check param description words too
+    for p in tool["parameters"].get("properties", {}).values():
+        pdesc = p.get("description", "").lower()
+        tool_words.update(re.findall(r'\w+', pdesc))
+    overlap = tool_words & user_words
+    # Filter common stopwords from overlap
+    stopwords = {"a", "an", "the", "for", "to", "of", "in", "is", "and", "or", "it"}
+    meaningful_overlap = overlap - stopwords
+    return len(meaningful_overlap) >= 1
+
+
+def generate_hybrid(messages, tools, confidence_threshold=0.99):
+    """Smart hybrid routing with per-tool completion and arg correction.
+
+    Strategies:
+    1. Enhanced tool descriptions for better FunctionGemma accuracy.
+    2. Integer arg post-processing from user text (fixes FunctionGemma's
+       common mistake of hallucinating integer values).
+    3. Per-tool single-call completion for multi-request messages:
+       after initial call, run each remaining relevant tool individually
+       (1 tool + force_tools = can't pick wrong tool).
+    4. Cloud fallback only when on-device produces nothing valid.
     """
     tools_by_name = {t["name"]: t for t in tools}
     tool_required = {t["name"]: t["parameters"].get("required", []) for t in tools}
+    user_text = messages[-1]["content"] if messages else ""
+    total_time = 0
 
-    # === Attempt 1: on-device with enhanced tool descriptions ===
+    # === Phase 1: on-device with all tools ===
     local = _run_cactus(messages, tools, tool_rag_top_k=0, enhance=True)
+    total_time += local["total_time_ms"]
     valid_calls = _validate_calls(local["function_calls"], tools_by_name, tool_required)
 
+    # Fix integer arguments
+    for i, call in enumerate(valid_calls):
+        tool = tools_by_name.get(call["name"])
+        if tool:
+            valid_calls[i]["arguments"] = _fix_integer_args(call, tool, user_text)
+
+    # === Phase 1b: retry without enhancement if nothing valid ===
+    if not valid_calls:
+        local2 = _run_cactus(messages, tools, tool_rag_top_k=0, enhance=False)
+        total_time += local2["total_time_ms"]
+        valid_calls = _validate_calls(local2["function_calls"], tools_by_name, tool_required)
+        for i, call in enumerate(valid_calls):
+            tool = tools_by_name.get(call["name"])
+            if tool:
+                valid_calls[i]["arguments"] = _fix_integer_args(call, tool, user_text)
+
+    # === Phase 2: per-tool completion for multi-request messages ===
+    # When user asks for multiple things, FunctionGemma often returns only 1 call.
+    # For each remaining RELEVANT tool, run a single-tool cactus call.
+    # With 1 tool + force_tools, the model can't pick the wrong tool.
+    if valid_calls and _is_multi_request(user_text):
+        called_names = {c["name"] for c in valid_calls}
+        for t in tools:
+            if t["name"] in called_names:
+                continue
+            if not _is_tool_relevant(t, user_text):
+                continue
+            single = _run_cactus(messages, [t], tool_rag_top_k=0, enhance=True)
+            total_time += single["total_time_ms"]
+            extra = _validate_calls(single["function_calls"], tools_by_name, tool_required)
+            for call in extra:
+                if call["name"] not in called_names:
+                    tool_def = tools_by_name.get(call["name"])
+                    if tool_def:
+                        call["arguments"] = _fix_integer_args(call, tool_def, user_text)
+                    valid_calls.append(call)
+                    called_names.add(call["name"])
+
+    # === Return on-device if valid ===
     if valid_calls:
         return {
             "function_calls": valid_calls,
-            "total_time_ms": local["total_time_ms"],
+            "total_time_ms": total_time,
             "confidence": local["confidence"],
             "source": "on-device",
         }
 
-    # === Attempt 2: retry without enhancement (different prompt path) ===
-    local2 = _run_cactus(messages, tools, tool_rag_top_k=0, enhance=False)
-    valid2 = _validate_calls(local2["function_calls"], tools_by_name, tool_required)
-
-    if valid2:
-        return {
-            "function_calls": valid2,
-            "total_time_ms": local["total_time_ms"] + local2["total_time_ms"],
-            "confidence": local2["confidence"],
-            "source": "on-device",
-        }
-
-    # === Attempt 3: cloud fallback (last resort) ===
+    # === Phase 3: cloud fallback ===
     cloud = generate_cloud(messages, tools)
     cloud["source"] = "cloud (fallback)"
     cloud["local_confidence"] = local["confidence"]
-    cloud["total_time_ms"] += local["total_time_ms"] + local2["total_time_ms"]
+    cloud["total_time_ms"] += total_time
     return cloud
 
 

@@ -1,13 +1,19 @@
-"""Debug script: see raw cactus output for failing cases."""
+"""Debug: see raw cactus output for ALL benchmark cases."""
 import sys, os, json
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cactus", "python", "src"))
 os.environ["CACTUS_NO_CLOUD_TELE"] = "1"
-from cactus import cactus_init, cactus_complete, cactus_destroy, cactus_reset
+from cactus import cactus_init, cactus_complete, cactus_destroy
 
 model_path = os.path.join(os.path.dirname(__file__), "..", "cactus", "weights", "functiongemma-270m-it")
-model = cactus_init(model_path)
 
-FAILING_CASES = [
+# Import benchmark cases
+parent = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(parent, "cactus", "python", "src"))
+
+# Inline the failing cases with enhanced tool descriptions
+from main import _enhance_tools, _coerce_args
+
+CASES = [
     {
         "name": "alarm_10am",
         "messages": [{"role": "user", "content": "Set an alarm for 10 AM."}],
@@ -16,14 +22,7 @@ FAILING_CASES = [
                        "hour": {"type": "integer", "description": "Hour to set the alarm for"},
                        "minute": {"type": "integer", "description": "Minute to set the alarm for"}},
                        "required": ["hour", "minute"]}}],
-    },
-    {
-        "name": "timer_5min",
-        "messages": [{"role": "user", "content": "Set a timer for 5 minutes."}],
-        "tools": [{"name": "set_timer", "description": "Set a countdown timer",
-                   "parameters": {"type": "object", "properties": {
-                       "minutes": {"type": "integer", "description": "Number of minutes"}},
-                       "required": ["minutes"]}}],
+        "expected": [{"name": "set_alarm", "arguments": {"hour": 10, "minute": 0}}],
     },
     {
         "name": "reminder_meeting",
@@ -33,63 +32,73 @@ FAILING_CASES = [
                        "title": {"type": "string", "description": "Reminder title"},
                        "time": {"type": "string", "description": "Time for the reminder (e.g. 3:00 PM)"}},
                        "required": ["title", "time"]}}],
+        "expected": [{"name": "create_reminder", "arguments": {"title": "meeting", "time": "3:00 PM"}}],
     },
     {
-        "name": "message_alice",
-        "messages": [{"role": "user", "content": "Send a message to Alice saying good morning."}],
-        "tools": [{"name": "send_message", "description": "Send a message to a contact",
-                   "parameters": {"type": "object", "properties": {
-                       "recipient": {"type": "string", "description": "Name of the person to send the message to"},
-                       "message": {"type": "string", "description": "The message content to send"}},
-                       "required": ["recipient", "message"]}}],
-    },
-    {
-        "name": "music_among_three",
-        "messages": [{"role": "user", "content": "Play some jazz music."}],
+        "name": "reminder_among_four",
+        "messages": [{"role": "user", "content": "Remind me to call the dentist at 2:00 PM."}],
         "tools": [
-            {"name": "set_alarm", "description": "Set an alarm for a given time",
-             "parameters": {"type": "object", "properties": {
-                 "hour": {"type": "integer", "description": "Hour"}, "minute": {"type": "integer", "description": "Minute"}},
-                 "required": ["hour", "minute"]}},
-            {"name": "play_music", "description": "Play a song or playlist",
-             "parameters": {"type": "object", "properties": {
-                 "song": {"type": "string", "description": "Song or playlist name"}},
-                 "required": ["song"]}},
             {"name": "get_weather", "description": "Get current weather for a location",
-             "parameters": {"type": "object", "properties": {
-                 "location": {"type": "string", "description": "City name"}},
-                 "required": ["location"]}},
+             "parameters": {"type": "object", "properties": {"location": {"type": "string", "description": "City name"}}, "required": ["location"]}},
+            {"name": "send_message", "description": "Send a message to a contact",
+             "parameters": {"type": "object", "properties": {"recipient": {"type": "string", "description": "Name"}, "message": {"type": "string", "description": "Message"}}, "required": ["recipient", "message"]}},
+            {"name": "create_reminder", "description": "Create a reminder with a title and time",
+             "parameters": {"type": "object", "properties": {"title": {"type": "string", "description": "Reminder title"}, "time": {"type": "string", "description": "Time for the reminder (e.g. 3:00 PM)"}}, "required": ["title", "time"]}},
+            {"name": "set_alarm", "description": "Set an alarm for a given time",
+             "parameters": {"type": "object", "properties": {"hour": {"type": "integer", "description": "Hour"}, "minute": {"type": "integer", "description": "Minute"}}, "required": ["hour", "minute"]}},
+        ],
+        "expected": [{"name": "create_reminder", "arguments": {"title": "call the dentist", "time": "2:00 PM"}}],
+    },
+    {
+        "name": "message_and_weather",
+        "messages": [{"role": "user", "content": "Send a message to Bob saying hi and get the weather in London."}],
+        "tools": [
+            {"name": "get_weather", "description": "Get current weather for a location",
+             "parameters": {"type": "object", "properties": {"location": {"type": "string", "description": "City name"}}, "required": ["location"]}},
+            {"name": "send_message", "description": "Send a message to a contact",
+             "parameters": {"type": "object", "properties": {"recipient": {"type": "string", "description": "Name"}, "message": {"type": "string", "description": "Message"}}, "required": ["recipient", "message"]}},
+            {"name": "set_alarm", "description": "Set an alarm for a given time",
+             "parameters": {"type": "object", "properties": {"hour": {"type": "integer", "description": "Hour"}, "minute": {"type": "integer", "description": "Minute"}}, "required": ["hour", "minute"]}},
+        ],
+        "expected": [
+            {"name": "send_message", "arguments": {"recipient": "Bob", "message": "hi"}},
+            {"name": "get_weather", "arguments": {"location": "London"}},
         ],
     },
 ]
 
-for case in FAILING_CASES:
+PROMPTS = [
+    ("enhanced", "You are a function calling assistant. Call the correct function(s) with accurate arguments extracted from the user request. Use exact values from the request. If multiple actions are needed, make ALL function calls."),
+    ("baseline", "You are a helpful assistant that can use tools."),
+]
+
+for case in CASES:
     print(f"\n{'='*60}")
     print(f"CASE: {case['name']}")
     print(f"USER: {case['messages'][0]['content']}")
-    print(f"TOOLS: {[t['name'] for t in case['tools']]}")
+    print(f"EXPECTED: {json.dumps(case['expected'])}")
 
-    cactus_reset(model)
-    cactus_tools = [{"type": "function", "function": t} for t in case["tools"]]
-
-    raw_str = cactus_complete(
-        model,
-        [{"role": "system", "content": "You are a function calling assistant. Analyze the user request and call the correct function(s) with accurate arguments."}] + case["messages"],
-        tools=cactus_tools,
-        force_tools=True,
-        max_tokens=512,
-        stop_sequences=["<|im_end|>", "<end_of_turn>"],
-        tool_rag_top_k=0,
-        confidence_threshold=0.05,
-    )
-
-    try:
-        raw = json.loads(raw_str)
-        print(f"CONFIDENCE: {raw.get('confidence', 'N/A')}")
-        print(f"CLOUD_HANDOFF: {raw.get('cloud_handoff', 'N/A')}")
-        print(f"FUNCTION_CALLS: {json.dumps(raw.get('function_calls', []), indent=2)}")
-        print(f"RESPONSE: {raw.get('response', 'N/A')}")
-    except json.JSONDecodeError:
-        print(f"RAW (unparseable): {raw_str[:500]}")
-
-cactus_destroy(model)
+    for prompt_name, prompt in PROMPTS:
+        for enhance in [True, False]:
+            label = f"{prompt_name}+{'enhanced_tools' if enhance else 'raw_tools'}"
+            model = cactus_init(model_path)
+            actual_tools = _enhance_tools(case["tools"]) if enhance else case["tools"]
+            cactus_tools = [{"type": "function", "function": t} for t in actual_tools]
+            raw_str = cactus_complete(
+                model,
+                [{"role": "system", "content": prompt}] + case["messages"],
+                tools=cactus_tools,
+                force_tools=True,
+                max_tokens=512,
+                stop_sequences=["<|im_end|>", "<end_of_turn>"],
+                tool_rag_top_k=0,
+                confidence_threshold=0.05,
+            )
+            cactus_destroy(model)
+            try:
+                raw = json.loads(raw_str)
+                calls = raw.get("function_calls", [])
+                conf = raw.get("confidence", 0)
+                print(f"  [{label}] conf={conf:.4f} calls={json.dumps(calls)}")
+            except:
+                print(f"  [{label}] PARSE ERROR: {raw_str[:200]}")
