@@ -9,10 +9,10 @@ from google import genai
 from google.genai import types
 from collections import defaultdict, deque
 
-
+model = cactus_init(functiongemma_path) #loads once on import 
 def generate_cactus(messages, tools):
     """Run function calling on-device via FunctionGemma + Cactus."""
-    model = cactus_init(functiongemma_path)
+    # model = cactus_init(functiongemma_path)
 
     cactus_tools = [{
         "type": "function",
@@ -28,7 +28,7 @@ def generate_cactus(messages, tools):
         stop_sequences=["<|im_end|>", "<end_of_turn>"],
     )
 
-    cactus_destroy(model)
+    # cactus_destroy(model)
 
     try:
         raw = json.loads(raw_str)
@@ -107,9 +107,20 @@ SEND_PATTERNS = [
     # "text NAME saying CONTENT"
     (r"(?:text|message)\s+(\w+)\s+saying\s+(.+?)(?:\.|$)",  0.85),
 ]
+#Alarm : extract hour + minute 
+ALARM_PATTERNS = [
+    # "6 AM", "10 AM", "9 PM"
+    (r"(\d{1,2})\s*AM",  lambda h, _: (int(h), 0)),
+    (r"(\d{1,2})\s*PM",  lambda h, _: (int(h) + 12, 0)),
+    # "8:15 AM"
+    (r"(\d{1,2}):(\d{2})\s*AM", lambda h, m: (int(h), int(m))),
+    (r"(\d{1,2}):(\d{2})\s*PM", lambda h, m: (int(h) + 12, int(m))),
+    # "6:45 AM"  
+    (r"(\d{1,2}):(\d{2})", lambda h, m: (int(h), int(m))),
+]
 
-# Node 1 - symbolic extracter 
-def symbolic_extract(query: str) -> dict:
+# Node 1 - symbolic extracter for message passing
+def symbolic_extract_send(query: str) -> dict:
     """
     Pure regex extraction for send_message user input.
     Returns recipient, message, confidence.
@@ -139,6 +150,24 @@ def symbolic_extract(query: str) -> dict:
             }
 
     return {"recipient": None, "message": None, "confidence": 0.0}
+
+# Extractor for alarm
+def symbolic_extract_alarm(query: str) -> dict:
+    for pattern, extractor in ALARM_PATTERNS:
+        match = re.search(pattern, query, re.IGNORECASE)
+        if match:
+            groups = match.groups()
+            hour, minute = extractor(*groups) if len(groups) == 2 \
+                           else (int(groups[0]), 0)
+            return {"hour": hour, "minute": minute, "confidence": 1.0}
+    return {"confidence": 0.0}
+
+# Timer: extract minutes
+def symbolic_extract_timer(query: str) -> dict:
+    match = re.search(r"(\d+)\s*minute", query, re.IGNORECASE)
+    if match:
+        return {"minutes": int(match.group(1)), "confidence": 1.0}
+    return {"confidence": 0.0}
 
 #Node 2 - Query rewriter (make indirect queries direct before 
 # hitting FunctionGemma) - support edge 
@@ -287,8 +316,8 @@ class TrafficShifter:
 shifter = TrafficShifter()
 
 
-
-def generate_hybrid(messages, tools, confidence_threshold=0.99):
+#Lowered confidence threshold from 0.99 to 0.85
+def generate_hybrid(messages, tools, confidence_threshold=0.85):
     start = time.time()
     query = messages[-1]["content"]
     intent_count = count_intents(query)
@@ -297,7 +326,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
     # Symbolic extraction
      # Only for send_message, single intent queries
     if "send_message" in tool_names and intent_count == 1:
-        features = symbolic_extract(query)
+        features = symbolic_extract_send(query)
         if features["confidence"] >= confidence_threshold:
             # Perfect extraction — skip ALL model calls
             return {
@@ -308,6 +337,28 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                         "message":   features["message"],
                     }
                 }],
+                "source":        "on-device",
+                "total_time_ms": (time.time() - start) * 1000,
+            }
+    # ── Symbolic: set_alarm ──────────────────────────────────
+    if "set_alarm" in tool_names and intent_count == 1:
+        f = symbolic_extract_alarm(query)
+        if f["confidence"] == 1.0:
+            return {
+                "function_calls": [{"name": "set_alarm",
+                    "arguments": {"hour":   f["hour"],
+                                  "minute": f["minute"]}}],
+                "source":        "on-device",
+                "total_time_ms": (time.time() - start) * 1000,
+            }
+
+    # ── Symbolic: set_timer ──────────────────────────────────
+    if "set_timer" in tool_names and intent_count == 1:
+        f = symbolic_extract_timer(query)
+        if f["confidence"] == 1.0:
+            return {
+                "function_calls": [{"name": "set_timer",
+                    "arguments": {"minutes": f["minutes"]}}],
                 "source":        "on-device",
                 "total_time_ms": (time.time() - start) * 1000,
             }
@@ -341,7 +392,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         # ── NODE 6: Validate output (edge, ~0ms) ─────────────
         local_valid = is_valid(local, tools, intent_count)
 
-        if local_valid and local_conf > confidence_threshold:
+        if local_valid and local_conf > 0.5:
             # Record success → shifter increases local probability
             shifter.record_outcome(category, succeeded=True)
             local["source"]        = "on-device"
