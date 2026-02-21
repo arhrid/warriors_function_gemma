@@ -2,10 +2,11 @@ import sys
 sys.path.insert(0, "cactus/python/src")
 functiongemma_path = "cactus/weights/functiongemma-270m-it"
 
-import json, os, re, time
+import json, os, re, time, random
 from cactus import cactus_init, cactus_complete, cactus_destroy
 from google import genai
 from google.genai import types
+from collections import defaultdict, deque
 
 
 def generate_cactus(messages, tools):
@@ -365,14 +366,117 @@ def _is_tool_relevant(tool, user_text):
     meaningful_overlap = overlap - stopwords
     return len(meaningful_overlap) >= 1
 
+# ── Query rewriter ────────────────────────────────────────────
+REWRITE_RULES = [
+    (r"wake me up at",              "set an alarm for"),
+    (r"wake me up",                 "set an alarm for 7am"),
+    (r"reach out to (\w+)",         r"send a message to \1 saying"),
+    (r"what'?s?\s+it like in",      "get weather in"),
+    (r"how'?s?\s+the weather in",   "get weather in"),
+    (r"let (\w+) know",             r"send a message to \1 saying"),
+    (r"shoot (\w+) a text",         r"send a message to \1 saying"),
+    (r"ping (\w+)",                 r"send a message to \1 saying"),
+    (r"tell (\w+) that",            r"send a message to \1 saying"),
+    (r"play some",                  "play"),
+    (r"what'?s?\s+the forecast in", "get weather in"),
+]
+
+def _rewrite_query(query: str) -> str:
+    for pattern, replacement in REWRITE_RULES:
+        query = re.sub(pattern, replacement, query, flags=re.IGNORECASE)
+    return query
+
+
+# ── Intent counter ────────────────────────────────────────────
+AND_KEYWORDS = [" and ", " also ", " plus ", " then ", " as well"]
+
+def _count_intents(query: str) -> int:
+    return 1 + sum(1 for kw in AND_KEYWORDS if kw in query.lower())
+
+
+# ── Traffic shifter ───────────────────────────────────────────
+class TrafficShifter:
+    def __init__(
+        self,
+        window_size:        int   = 20,
+        initial_local_prob: float = 0.80,
+        min_local_prob:     float = 0.20,
+        max_local_prob:     float = 0.99,
+        shift_rate:         float = 0.08,
+    ):
+        self.min_local_prob = min_local_prob
+        self.max_local_prob = max_local_prob
+        self.shift_rate     = shift_rate
+        self.outcomes       = defaultdict(lambda: deque(maxlen=window_size))
+        self.local_prob     = defaultdict(lambda: initial_local_prob)
+
+    def categorize(self, query: str) -> str:
+        q            = query.lower()
+        intent_count = _count_intents(query)
+        if any(w in q for w in ["weather", "forecast"]):
+            tool_type = "weather"
+        elif any(w in q for w in ["alarm", "wake"]):
+            tool_type = "alarm"
+        elif any(w in q for w in ["message", "text", "tell", "ping", "send"]):
+            tool_type = "message"
+        elif any(w in q for w in ["timer", "countdown"]):
+            tool_type = "timer"
+        elif any(w in q for w in ["remind", "reminder"]):
+            tool_type = "reminder"
+        elif any(w in q for w in ["play", "music", "song"]):
+            tool_type = "music"
+        elif any(w in q for w in ["contact", "find", "look"]):
+            tool_type = "contacts"
+        else:
+            tool_type = "other"
+        return f"{intent_count}intent_{tool_type}"
+
+    def should_use_local(self, category: str) -> bool:
+        return random.random() < self.local_prob[category]
+
+    def record_outcome(self, category: str, succeeded: bool):
+        self.outcomes[category].append(succeeded)
+        window = list(self.outcomes[category])
+        if len(window) >= 3:
+            success_rate = sum(window) / len(window)
+            current      = self.local_prob[category]
+            self.local_prob[category] = max(
+                self.min_local_prob,
+                min(
+                    self.max_local_prob,
+                    current + self.shift_rate * (success_rate - current)
+                )
+            )
+
+
+# module level — persists across all calls
+shifter = TrafficShifter()
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
     """Smart hybrid: cactus selects tools, regex reconstructs args."""
+    start = time.time()
     tools_by_name = {t["name"]: t for t in tools}
     tool_required = {t["name"]: t["parameters"].get("required", []) for t in tools}
     user_text = messages[-1]["content"] if messages else ""
     total_time = 0
+    
+    rewritten          = _rewrite_query(user_text)
+    rewritten_messages = messages[:-1] + [
+        {"role": "user", "content": rewritten}
+    ]
+    intent_count = _count_intents(user_text)
+    n_tools = len(tools)
+    
+    category     = shifter.categorize(user_text)
+    use_local    = shifter.should_use_local(category)
 
+    # if shifter says cloud AND multi-intent → skip local entirely
+    if not use_local and intent_count >= 2:
+        cloud = generate_cloud(messages, tools)
+        cloud["source"]        = "cloud (fallback)"
+        cloud["total_time_ms"] = (time.time() - start) * 1000
+        return cloud
+    
     def _reconstruct_args(call):
         tool = tools_by_name.get(call["name"])
         if not tool:
@@ -385,7 +489,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
             call["arguments"] = _fix_string_args(call, tool, user_text)
 
     # Phase 1: on-device with enhanced tools
-    local = _run_cactus(messages, tools, tool_rag_top_k=0, enhance=True)
+    local = _run_cactus(rewritten_messages, tools, tool_rag_top_k=0, enhance=True)
     total_time += local["total_time_ms"]
     valid_calls = _validate_calls(local["function_calls"], tools_by_name, tool_required)
 
@@ -430,6 +534,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
                     called_names.add(call["name"])
 
     if valid_calls:
+        shifter.record_outcome(category, succeeded=True)
         return {
             "function_calls": valid_calls,
             "total_time_ms": total_time,
@@ -438,6 +543,7 @@ def generate_hybrid(messages, tools, confidence_threshold=0.99):
         }
 
     # Phase 3: cloud fallback
+    shifter.record_outcome(category, succeeded=False)
     cloud = generate_cloud(messages, tools)
     cloud["source"] = "cloud (fallback)"
     cloud["local_confidence"] = local["confidence"]
