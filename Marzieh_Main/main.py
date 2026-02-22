@@ -25,88 +25,101 @@ def _ensure_genai():
 
 def generate_cactus(messages, tools):
     """Run function calling on-device via FunctionGemma + Cactus."""
-    model = cactus_init(functiongemma_path)
-
-    cactus_tools = [{
-        "type": "function",
-        "function": t,
-    } for t in tools]
-
-    raw_str = cactus_complete(
-        model,
-        [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
-        tools=cactus_tools,
-        force_tools=True,
-        max_tokens=256,
-        stop_sequences=["<|im_end|>", "<end_of_turn>"],
-    )
-
-    cactus_destroy(model)
-
     try:
-        raw = json.loads(raw_str)
-    except json.JSONDecodeError:
+        model = cactus_init(functiongemma_path)
+
+        cactus_tools = [{
+            "type": "function",
+            "function": t,
+        } for t in tools]
+
+        raw_str = cactus_complete(
+            model,
+            [{"role": "system", "content": "You are a helpful assistant that can use tools."}] + messages,
+            tools=cactus_tools,
+            force_tools=True,
+            max_tokens=256,
+            stop_sequences=["<|im_end|>", "<end_of_turn>"],
+        )
+
+        cactus_destroy(model)
+
+        try:
+            raw = json.loads(raw_str)
+        except json.JSONDecodeError:
+            return {
+                "function_calls": [],
+                "total_time_ms": 0,
+                "confidence": 0,
+            }
+
+        return {
+            "function_calls": raw.get("function_calls", []),
+            "total_time_ms": raw.get("total_time_ms", 0),
+            "confidence": raw.get("confidence", 0),
+        }
+    except Exception:
         return {
             "function_calls": [],
             "total_time_ms": 0,
             "confidence": 0,
         }
 
-    return {
-        "function_calls": raw.get("function_calls", []),
-        "total_time_ms": raw.get("total_time_ms", 0),
-        "confidence": raw.get("confidence", 0),
-    }
-
 
 def generate_cloud(messages, tools):
     """Run function calling via Gemini Cloud API."""
-    _ensure_genai()
-    client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+    try:
+        _ensure_genai()
+        client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
-    gemini_tools = [
-        types.Tool(function_declarations=[
-            types.FunctionDeclaration(
-                name=t["name"],
-                description=t["description"],
-                parameters=types.Schema(
-                    type="OBJECT",
-                    properties={
-                        k: types.Schema(type=v["type"].upper(), description=v.get("description", ""))
-                        for k, v in t["parameters"]["properties"].items()
-                    },
-                    required=t["parameters"].get("required", []),
-                ),
-            )
-            for t in tools
-        ])
-    ]
+        gemini_tools = [
+            types.Tool(function_declarations=[
+                types.FunctionDeclaration(
+                    name=t["name"],
+                    description=t["description"],
+                    parameters=types.Schema(
+                        type="OBJECT",
+                        properties={
+                            k: types.Schema(type=v["type"].upper(), description=v.get("description", ""))
+                            for k, v in t["parameters"]["properties"].items()
+                        },
+                        required=t["parameters"].get("required", []),
+                    ),
+                )
+                for t in tools
+            ])
+        ]
 
-    contents = [m["content"] for m in messages if m["role"] == "user"]
+        contents = [m["content"] for m in messages if m["role"] == "user"]
 
-    start_time = time.time()
+        start_time = time.time()
 
-    gemini_response = client.models.generate_content(
-        model="gemini-2.5-flash",
-        contents=contents,
-        config=types.GenerateContentConfig(tools=gemini_tools),
-    )
+        gemini_response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=contents,
+            config=types.GenerateContentConfig(tools=gemini_tools),
+        )
 
-    total_time_ms = (time.time() - start_time) * 1000
+        total_time_ms = (time.time() - start_time) * 1000
 
-    function_calls = []
-    for candidate in gemini_response.candidates:
-        for part in candidate.content.parts:
-            if part.function_call:
-                function_calls.append({
-                    "name": part.function_call.name,
-                    "arguments": dict(part.function_call.args),
-                })
+        function_calls = []
+        for candidate in gemini_response.candidates:
+            for part in candidate.content.parts:
+                if part.function_call:
+                    function_calls.append({
+                        "name": part.function_call.name,
+                        "arguments": dict(part.function_call.args),
+                    })
 
-    return {
-        "function_calls": function_calls,
-        "total_time_ms": total_time_ms,
-    }
+        return {
+            "function_calls": function_calls,
+            "total_time_ms": total_time_ms,
+        }
+    except Exception:
+        return {
+            "function_calls": [],
+            "total_time_ms": 0,
+        }
 
 
 def generate_hybrid(messages, tools, confidence_threshold=0.99):
