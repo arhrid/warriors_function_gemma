@@ -14,13 +14,13 @@ A multi-layered routing system that dynamically balances on-device (FunctionGemm
 
 ## Core Components
 
-### 🚀 Model Persistence Optimization
+### Model Persistence Optimization
 ```python
 model = cactus_init(functiongemma_path)  # Load once at module level
 # Saves ~600ms per call: 850ms → 150ms
 ```
 
-### 🔄 Adaptive Traffic Shifter
+### Adaptive Traffic Shifter
 Learns optimal routing per query category through exponential moving average:
 ```python
 category = f"{intent_count}intent_{tool_type}"  # "2intent_weather"
@@ -28,14 +28,14 @@ success_rate = observe_outcomes()
 local_prob += shift_rate * (success_rate - current_prob)
 ```
 
-### ✍️ Query Rewriter
+### Query Rewriter
 Normalizes indirect phrasing before processing:
 ```python
 "wake me up at 8am" → "set an alarm for 8am"
 "ping Alice" → "send a message to Alice saying"
 ```
 
-### 🎯 Hybrid Argument Extraction
+### Hybrid Argument Extraction
 - **Tool Selection**: FunctionGemma picks which tools to call
 - **Argument Extraction**: Regex deterministically extracts values
 ```python
@@ -68,7 +68,7 @@ Query → Rewrite → Traffic Decision → Local Processing → Regex Reconstruc
 
 ## Architecture Benefits
 
-- ⚡ **4.7+ point score improvement** from model persistence optimization
-- 🧠 **Adaptive learning** converges to optimal routing per query type
-- 🎯 **Cross-domain robust** through type-driven argument extraction
-- 🔧 **Production ready** with proper error handling and fallback strategies
+- **4.7+ point score improvement** from model persistence optimization
+- **Adaptive learning** converges to optimal routing per query type
+- **Cross-domain robust** through type-driven argument extraction
+- **Production ready** with proper error handling and fallback strategies
