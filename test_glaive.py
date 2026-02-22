@@ -20,10 +20,23 @@ def extract_sample(sample):
         system = sample.get("system", "")
         chat   = sample.get("chat", "")
 
-        tool_match = re.search(r'\[(.+?)\]', system, re.DOTALL)
-        if not tool_match:
+        # Tools are individual {…} objects with nested braces — use JSON decoder
+        tools = []
+        decoder = json.JSONDecoder()
+        idx = 0
+        while idx < len(system):
+            if system[idx] == '{':
+                try:
+                    obj, end = decoder.raw_decode(system, idx)
+                    if isinstance(obj, dict) and "name" in obj:
+                        tools.append(obj)
+                    idx = end
+                except json.JSONDecodeError:
+                    idx += 1
+            else:
+                idx += 1
+        if not tools:
             return None
-        tools = json.loads(f"[{tool_match.group(1)}]")
 
         tool_desc = " ".join(
             t.get("description", "") for t in tools
@@ -37,11 +50,21 @@ def extract_sample(sample):
             return None
         user_msg = user_match.group(1).strip()
 
-        call_match = re.search(
-            r'<functioncall>\s*({.+?})', chat, re.DOTALL)
-        if not call_match:
+        # Extract function call — Glaive uses single-quoted arguments strings
+        fc_pos = chat.find("<functioncall>")
+        if fc_pos < 0:
             return None
-        call = json.loads(call_match.group(1))
+        fc_text = chat[fc_pos + len("<functioncall>"):]
+        # Replace single-quoted arguments with inline JSON
+        fc_text = re.sub(r'"arguments"\s*:\s*\'(.+?)\'', r'"arguments": \1', fc_text)
+        fc_text = re.sub(r"'arguments'\s*:\s*'(.+?)'", r'"arguments": \1', fc_text)
+        brace_pos = fc_text.find("{")
+        if brace_pos < 0:
+            return None
+        try:
+            call, _ = json.JSONDecoder().raw_decode(fc_text, brace_pos)
+        except json.JSONDecodeError:
+            return None
 
         # Convert tools to your format
         converted_tools = []
@@ -121,8 +144,11 @@ def run_on_glaive(max_cases=20):
 
     print("-" * 85)
     print(f"\n📊 Results on {n} Glaive cases:")
-    print(f"   Tool name accuracy : {name_correct}/{n} ({100*name_correct/n:.0f}%)")
-    print(f"   Avg time           : {total_time_ms/n:.0f}ms")
+    if n > 0:
+        print(f"   Tool name accuracy : {name_correct}/{n} ({100*name_correct/n:.0f}%)")
+        print(f"   Avg time           : {total_time_ms/n:.0f}ms")
+    else:
+        print("   No relevant cases found.")
 
 
 if __name__ == "__main__":

@@ -38,14 +38,26 @@ def generate_cactus(messages, tools):
     }
 
 
+_cloud_client = None
+
+
+def _get_cloud_client():
+    global _cloud_client
+    if _cloud_client is None:
+        api_key = os.environ.get("GEMINI_API_KEY")
+        if not api_key:
+            return None
+        try:
+            _cloud_client = genai.Client(api_key=api_key)
+        except Exception:
+            return None
+    return _cloud_client
+
+
 def generate_cloud(messages, tools):
     """Run function calling via Gemini Cloud API."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return {"function_calls": [], "total_time_ms": 0}
-    try:
-        client = genai.Client(api_key=api_key)
-    except Exception:
+    client = _get_cloud_client()
+    if not client:
         return {"function_calls": [], "total_time_ms": 0}
     try:
         gemini_tools = [
@@ -70,7 +82,14 @@ def generate_cloud(messages, tools):
         gemini_response = client.models.generate_content(
             model="gemini-2.5-flash",
             contents=contents,
-            config=types.GenerateContentConfig(tools=gemini_tools),
+            config=types.GenerateContentConfig(
+                tools=gemini_tools,
+                system_instruction=(
+                    "You are a function calling assistant. "
+                    "Call the correct function(s) with accurate arguments. "
+                    "Use exact values from the user request."
+                ),
+            ),
         )
         total_time_ms = (time.time() - start_time) * 1000
         function_calls = []
@@ -128,16 +147,19 @@ def _enhance_tools(tools):
 
 def _validate_calls(function_calls, tools_by_name, tool_required):
     valid = []
-    seen_names = set()
+    seen_calls = set()
     for fc in function_calls:
         name = fc.get("name", "")
         args = fc.get("arguments", {})
-        if name in tools_by_name and name not in seen_names:
+        if name in tools_by_name:
             required = tool_required.get(name, [])
             if all(r in args for r in required):
                 coerced_args = _coerce_args(args, tools_by_name[name])
-                valid.append({"name": name, "arguments": coerced_args})
-                seen_names.add(name)
+                call_sig = (name, tuple(sorted(
+                    (k, str(v)) for k, v in coerced_args.items())))
+                if call_sig not in seen_calls:
+                    valid.append({"name": name, "arguments": coerced_args})
+                    seen_calls.add(call_sig)
     return valid
 
 
@@ -185,6 +207,7 @@ def _extract_numbers(text):
 
 
 def _extract_time(text):
+    # 12-hour format with AM/PM
     match = re.search(r'(\d{1,2})(?::(\d{2}))?\s*(AM|PM|am|pm|a\.m\.|p\.m\.)', text)
     if match:
         hour = int(match.group(1))
@@ -195,6 +218,13 @@ def _extract_time(text):
         elif period == "AM" and hour == 12:
             hour = 0
         return hour, minute
+    # 24-hour format: "14:30", "09:10" (not inside a date like 2026-02-22)
+    match = re.search(r'(?:^|[\s,at])(\d{1,2}):(\d{2})(?:\s|$|[,;.])', text)
+    if match:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
     return None, None
 
 
@@ -354,15 +384,83 @@ def _try_construct_call(tool, user_text):
                     m = re.search(r'(?:in|for)\s+(.+?)' + temporal_stop + r'?(?:\s+and\s+|,\s*|\s*[.!?]?\s*$)', user_text, re.IGNORECASE)
                 if m:
                     val = m.group(1).strip().rstrip('.,!')
-                    # Strip trailing temporal words that slipped through
                     val = re.sub(r'\s+(?:right now|today|tomorrow|tonight)$', '', val, flags=re.IGNORECASE)
+            elif any(w in pdesc for w in ("date", "day", "when")):
+                matched_pattern = True
+                m = re.search(r'(\d{4}-\d{2}-\d{2})', user_text)
+                if m:
+                    val = m.group(1)
+                elif "tomorrow" in user_text.lower():
+                    from datetime import date, timedelta
+                    val = (date.today() + timedelta(days=1)).isoformat()
+                elif "today" in user_text.lower():
+                    from datetime import date
+                    val = date.today().isoformat()
+            elif any(w in pdesc for w in ("start_time", "end_time", "start time", "end time", "datetime")):
+                matched_pattern = True
+                dts = re.findall(r'(\d{4}-\d{2}-\d{2})\s+(\d{1,2}:\d{2})', user_text)
+                if dts:
+                    if "start" in pname and dts:
+                        val = f"{dts[0][0]} {dts[0][1]}"
+                    elif "end" in pname and len(dts) >= 2:
+                        val = f"{dts[1][0]} {dts[1][1]}"
+            elif any(w in pdesc for w in ("language", "target_language", "source_language")):
+                matched_pattern = True
+                langs = ["spanish", "french", "german", "italian", "portuguese",
+                         "japanese", "chinese", "korean", "arabic", "hindi",
+                         "russian", "english", "dutch", "swedish"]
+                for lang in langs:
+                    if lang in user_text.lower():
+                        val = lang.capitalize()
+                        break
             else:
-                has_unknown_params = True
+                # Check for enum hints in description
+                enum_match = re.search(r'(?:One of|one of|Possible values?|Options?):\s*(.+?)(?:\.|$)', pinfo.get("description", ""))
+                if enum_match:
+                    matched_pattern = True
+                    choices = [c.strip().strip("'\"") for c in re.split(r'[,;]|\bor\b', enum_match.group(1))]
+                    user_lower = user_text.lower()
+                    for choice in choices:
+                        if choice.lower() in user_lower or choice.replace("_", " ").lower() in user_lower:
+                            val = choice
+                            break
+                else:
+                    has_unknown_params = True
             if val:
                 val = _strip_quotes(val)
                 args[pname] = val
 
-        elif ptype in ("array", "object"):
+        elif ptype == "array":
+            item_type = pinfo.get("items", {}).get("type", "string")
+            if item_type == "string":
+                # Try quoted items first
+                items = re.findall(r"'([^']+)'", user_text)
+                if not items:
+                    items = re.findall(r'"([^"]+)"', user_text)
+                if not items:
+                    # "add X, Y, and Z to list/cart"
+                    if any(w in pdesc for w in ("item", "list", "add", "shop", "grocer")):
+                        m = re.search(r'(?:add|put|get|buy)\s+(.+?)(?:\s+to\s+|\s+on\s+|\s+from\s+)', user_text, re.IGNORECASE)
+                        if m:
+                            raw = m.group(1)
+                            items = re.split(r',\s*(?:and\s+)?|\s+and\s+', raw)
+                            items = [i.strip() for i in items if i.strip()]
+                    elif any(w in pdesc for w in ("attendee", "invite", "email")):
+                        items = re.findall(r'[\w.+-]+@[\w.-]+\.\w+', user_text)
+                    elif any(w in pdesc for w in ("contact", "name", "person", "call", "bypass")):
+                        m = re.search(r'(?:from|allow|let)\s+(.+?)(?:\s+through|\s+bypass|$)', user_text, re.IGNORECASE)
+                        if m:
+                            raw = m.group(1)
+                            items = re.split(r',\s*(?:and\s+)?|\s+and\s+', raw)
+                            items = [i.strip() for i in items if i.strip()]
+                if items:
+                    args[pname] = items
+                else:
+                    has_unknown_params = True
+            else:
+                has_unknown_params = True
+
+        elif ptype == "object":
             has_unknown_params = True
 
         elif ptype == "number":
@@ -406,19 +504,28 @@ _ACTION_SYNONYMS = {
 
 def _is_multi_request(text):
     lower = text.lower()
-    if " and " not in lower and ", " not in lower and "; " not in lower and " then " not in lower:
-        return False
-    parts = re.split(r',\s+and\s+|\s+and\s+|,\s+|\s*;\s*|\s+then\s+', lower)
-    if len(parts) < 2:
-        return False
     action_words = {"set", "get", "send", "check", "find", "look", "play",
                     "remind", "text", "search", "create", "what", "how",
                     "tell", "let", "ping", "shoot", "book", "convert",
                     "translate", "add", "enable", "schedule", "compare",
-                    "turn", "put", "start", "message"}
-    action_parts = sum(1 for p in parts
-                       if any(p.strip().startswith(w) for w in action_words))
-    return action_parts >= 2
+                    "turn", "put", "start", "message", "also"}
+    # Check conjunctions
+    if " and " in lower or ", " in lower or "; " in lower or " then " in lower:
+        parts = re.split(r',\s+and\s+|\s+and\s+|,\s+|\s*;\s*|\s+then\s+', lower)
+        if len(parts) >= 2:
+            action_parts = sum(1 for p in parts
+                               if any(p.strip().startswith(w) for w in action_words))
+            if action_parts >= 2:
+                return True
+    # Check period-separated sentences: "Set alarm. Check weather."
+    if ". " in lower:
+        sentences = [s.strip() for s in lower.split(". ") if s.strip()]
+        if len(sentences) >= 2:
+            action_parts = sum(1 for s in sentences
+                               if any(s.startswith(w) for w in action_words))
+            if action_parts >= 2:
+                return True
+    return False
 
 
 def _relevance_score(tool, user_text):
@@ -483,6 +590,14 @@ REWRITE_RULES = [
     (r"start a (\d+)\s*(?:minute|min)\s*(?:countdown|timer)", r"set a timer for \1 minutes"),
     (r"(\d+)\s*(?:minute|min)\s*countdown", r"\1 minute timer"),
     (r"set a reminder\b",          "remind me"),
+    (r"what'?s?\s+the weather\b",   "get weather"),
+    (r"can you (?:please )?",       ""),
+    (r"could you (?:please )?",     ""),
+    (r"i need (?:you )?to ",        ""),
+    (r"i want (?:you )?to ",        ""),
+    (r"grab (?:an? )?(?:ride|cab|uber|lyft)", "book a ride"),
+    (r"order (?:an? )?(?:ride|cab|uber|lyft)", "book a ride"),
+    (r"get me (?:an? )?(?:ride|cab)", "book a ride"),
 ]
 
 

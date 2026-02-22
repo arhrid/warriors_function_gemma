@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git checkout:*)",
+      "Bash(git stash:*)",
+      "Bash(cd:*)",
+      "Bash(export:*)",
+      "Bash(cd /Users/arhrid/antima-workspace/dm_cc_hack/functiongemma-hackathon && python benchmark.py 2>&1)",
+      "Bash(tail:*)",
+      "Bash(cd /Users/arhrid/antima-workspace/dm_cc_hack/functiongemma-hackathon && cactus auth 2>&1)",
+      "Bash(cd /Users/arhrid/antima-workspace/dm_cc_hack && git clone https://github.com/arhrid/functiongemma-hackathon.git 2>&1)",
+      "Bash(cd /Users/arhrid/antima-workspace/dm_cc_hack/functiongemma-hackathon && cactus download google/functiongemma-270m-it --reconvert 2>&1)",
+      "Bash(python:*)",
+      "Bash(git fetch:*)",
+      "Bash(git merge:*)",
+      "Bash(cd /Users/arhrid/antima-workspace/dm_cc_hack/functiongemma-hackathon && git submodule update --init --recursive 2>&1)",
+      "Bash(cd /Users/arhrid/antima-workspace/dm_cc_hack/functiongemma-hackathon/cactus && git submodule update --init --recursive 2>&1)",
+      "Bash(python3:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git checkout main && git pull origin main 2>&1)",
+      "Bash(gh pr:*)",
+      "Bash(git pull:*)",
+      "Bash(git rebase:*)"
+    ]
+  }
+}

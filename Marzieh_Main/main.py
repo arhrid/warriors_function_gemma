@@ -1,7 +1,10 @@
+import sys, os
 
-import sys
-sys.path.insert(0, "cactus/python/src")
-functiongemma_path = "cactus/weights/functiongemma-270m-it"
+# Resolve paths relative to this file so they work from any CWD
+_this_dir = os.path.dirname(os.path.abspath(__file__))
+_parent_dir = os.path.dirname(_this_dir)
+sys.path.insert(0, os.path.join(_parent_dir, "cactus", "python", "src"))
+functiongemma_path = os.path.join(_parent_dir, "cactus", "weights", "functiongemma-270m-it")
 
 import json, os, time
 from cactus import cactus_init, cactus_complete, cactus_destroy
