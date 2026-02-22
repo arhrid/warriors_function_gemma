@@ -7,8 +7,20 @@ functiongemma_path = os.path.join(_this_dir, "cactus", "weights", "functiongemma
 
 import json, re, time
 from cactus import cactus_init, cactus_complete, cactus_destroy
-from google import genai
-from google.genai import types
+
+# Lazy-load google.genai to avoid subprocess import at module load time
+# (submission server blocks subprocess imports)
+genai = None
+types = None
+
+
+def _ensure_genai():
+    global genai, types
+    if genai is None:
+        from google import genai as _genai
+        from google.genai import types as _types
+        genai = _genai
+        types = _types
 
 # Global model cache to avoid repeated init/destroy overhead
 _cached_model = None
@@ -44,6 +56,7 @@ _cloud_client = None
 def _get_cloud_client():
     global _cloud_client
     if _cloud_client is None:
+        _ensure_genai()
         api_key = os.environ.get("GEMINI_API_KEY")
         if not api_key:
             return None
