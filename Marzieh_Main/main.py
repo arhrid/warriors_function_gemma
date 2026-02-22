@@ -8,8 +8,19 @@ functiongemma_path = os.path.join(_parent_dir, "cactus", "weights", "functiongem
 
 import json, os, time
 from cactus import cactus_init, cactus_complete, cactus_destroy
-from google import genai
-from google.genai import types
+
+# Lazy-load google.genai to avoid subprocess import at module load time
+genai = None
+types = None
+
+
+def _ensure_genai():
+    global genai, types
+    if genai is None:
+        from google import genai as _genai
+        from google.genai import types as _types
+        genai = _genai
+        types = _types
 
 
 def generate_cactus(messages, tools):
@@ -50,6 +61,7 @@ def generate_cactus(messages, tools):
 
 def generate_cloud(messages, tools):
     """Run function calling via Gemini Cloud API."""
+    _ensure_genai()
     client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
 
     gemini_tools = [
