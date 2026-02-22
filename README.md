@@ -12,7 +12,7 @@ A multi-layered routing system that dynamically balances on-device (FunctionGemm
 Core Components
 🚀 Model Persistence Optimization
 pythonmodel = cactus_init(functiongemma_path)  # Load once at module level
-# Saves ~600ms per call: 850ms → 150ms
+
 🔄 Adaptive Traffic Shifter
 Learns optimal routing per query category through exponential moving average:
 pythoncategory = f"{intent_count}intent_{tool_type}"  # "2intent_weather"
@@ -28,7 +28,7 @@ Tool Selection: FunctionGemma picks which tools to call
 Argument Extraction: Regex deterministically extracts values
 
 python# Model: {"name": "set_alarm", "arguments": {"hour": "ten"}}
-# Regex: {"hour": 10, "minute": 0}  # From "10 AM"
+
 ```
 
 ## Execution Flow
