@@ -7,8 +7,7 @@ The purpose of this document is to capture our usecase and the process.
 1. there is an active voice listening in our mac. 
 2. The user would say "hey warrior, message xxx.xxx.xxxx number on my whatsapp that we are set for dinner at XYZ for 5pm today. Then, email his reponse to xxx@gmail.com.
 
-## Our Architecture proposal for Internal logic of the generate_hybrid method in main.py
-# Hybrid Routing Architecture
+## Hybrid Routing Architecture
 
 A multi-layered routing system that dynamically balances on-device (FunctionGemma) and cloud (Gemini) execution for optimal performance and accuracy.
 
@@ -66,7 +65,6 @@ Query → Rewrite → Traffic Decision → Local Processing → Regex Reconstruc
 - **Performance Optimized**: Model persistence + smart cloud skipping
 - **High Accuracy**: Regex reconstruction ensures correct argument parsing
 
-## Architecture Benefits
 
 - **4.7+ point score improvement** from model persistence optimization
 - **Adaptive learning** converges to optimal routing per query type
